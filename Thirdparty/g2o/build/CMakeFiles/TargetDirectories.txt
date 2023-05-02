@@ -1,3 +1,0 @@
-/home/juo/MY_orb/Thirdparty/g2o/build/CMakeFiles/rebuild_cache.dir
-/home/juo/MY_orb/Thirdparty/g2o/build/CMakeFiles/g2o.dir
-/home/juo/MY_orb/Thirdparty/g2o/build/CMakeFiles/edit_cache.dir
