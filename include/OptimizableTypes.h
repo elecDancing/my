@@ -44,6 +44,7 @@ public:
     {
         const g2o::VertexSE3Expmap *v1 = static_cast<const g2o::VertexSE3Expmap *>(_vertices[0]);
         Eigen::Vector2d obs(_measurement);
+        //v1->estimate()为世界坐标系下三维点的坐标
         _error = obs - pCamera->project(v1->estimate().map(Xw));
     }
 

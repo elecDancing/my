@@ -4,7 +4,7 @@
  * @Author: xp.Zhang
  * @Date: 2023-04-30 20:34:01
  * @LastEditors: xp.Zhang
- * @LastEditTime: 2023-05-01 10:10:21
+ * @LastEditTime: 2023-05-03 18:08:44
 -->
 
 ## 修改的代码上传过程
@@ -16,7 +16,7 @@
 上传时候需要
 
 ```
-git push origin MY_modified:MY_modified
+git push origin MY_modified:record1
 ```
 
 ## 编译成功后，首次运行

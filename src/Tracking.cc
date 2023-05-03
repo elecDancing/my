@@ -1602,9 +1602,9 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
 
 /**
  * @brief 输入左目RGB或RGBA图像和深度图
- * 1、将图像转为mImGray和imDepth并初始化mCurrentFrame
- * 2、进行tracking过程
- * 输出世界坐标系到该帧相机坐标系的变换矩阵
+ *! 1、将图像转为mImGray和imDepth并初始化mCurrentFrame
+ *! 2、进行tracking过程
+ *! 3、输出世界坐标系到该帧相机坐标系的变换矩阵
  * @param imRGB 彩色图
  * @param imD 深度图
  * @param timestamp 时间戳
@@ -1636,7 +1636,7 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
     if((fabs(mDepthMapFactor-1.0f)>1e-5) && mImDepth.type()!=CV_32F)
         mImDepth.convertTo(mImDepth,CV_32F,mDepthMapFactor);
 
-    // Step 3：构造Frame
+    //! Step 3：构造Frame
     if (mSensor == System::RGBD)
         mCurrentFrame = Frame(mImGray,mImDepth,timestamp,mpORBextractorLeft,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera);
     else if(mSensor == System::IMU_RGBD)
@@ -1648,10 +1648,10 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
 #ifdef REGISTER_TIMES
     vdORBExtract_ms.push_back(mCurrentFrame.mTimeORB_Ext);
 #endif
-    // Step 4：跟踪
+    //! Step 4：跟踪
     Track();
 
-    // 返回当前帧的位姿
+    //! 返回当前帧的位姿
     return mCurrentFrame.GetPose();
 }
 
@@ -2090,7 +2090,7 @@ void Tracking::Track()
         mbMapUpdated = true;
     }
 
-    // Step 5 初始化
+    //! Step 5 初始化
     if(mState==NOT_INITIALIZED)
     {
         if(mSensor==System::STEREO || mSensor==System::RGBD || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD)
@@ -2377,8 +2377,9 @@ void Tracking::Track()
         std::chrono::steady_clock::time_point time_StartLMTrack = std::chrono::steady_clock::now();
 #endif
 
-        // Step 7 在跟踪得到当前帧初始姿态后，现在对local map进行跟踪得到更多的匹配，并优化当前位姿
-        // 前面只是跟踪一帧得到初始位姿，这里搜索局部关键帧、局部地图点，和当前帧进行投影匹配，得到更多匹配的MapPoints后进行Pose优化
+        //! Step 7 在跟踪得到当前帧初始姿态后，现在对local map进行跟踪得到更多的匹配，并优化当前位姿
+        // 前面只是跟踪一帧得到初始位姿，这里搜索局部关键帧、局部地图点，
+        // ? 和当前帧进行投影匹配，得到更多匹配的MapPoints后进行Pose优化
         // 在帧间匹配得到初始的姿态后，现在对local map进行跟踪得到更多的匹配，并优化当前位姿
         // local map:当前帧、当前帧的MapPoints、当前关键帧与其它关键帧共视关系
         // 前面主要是两两跟踪（恒速模型跟踪上一帧、跟踪参考帧），这里搜索局部关键帧后搜集所有局部MapPoints，
@@ -3511,6 +3512,7 @@ bool Tracking::TrackLocalMap()
     int inliers;
     // IMU未初始化，仅优化位姿
     if (!mpAtlas->isImuInitialized())
+        //!局部建图线程中的局部地图优化
         Optimizer::PoseOptimization(&mCurrentFrame);
     else
     {
