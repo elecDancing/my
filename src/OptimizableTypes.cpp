@@ -26,8 +26,8 @@ bool EdgeSE3ProjectXYZOnlyPose::read(std::istream &is)
     {
         is >> _measurement[i];
     }
-    for (int i = 0; i < 2; i++)
-        for (int j = i; j < 2; j++)
+    for (int i = 0; i < 3; i++)
+        for (int j = i; j < 3; j++)
         {
             is >> information()(i, j);
             if (i != j)
@@ -71,6 +71,53 @@ void EdgeSE3ProjectXYZOnlyPose::linearizeOplus()
 
     _jacobianOplusXi = -pCamera->projectJac(xyz_trans) * SE3deriv;
 }
+
+bool EdgeSE3XYZRGBDOnlyPose ::read(std::istream &is)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        is >> _measurement[i];
+    }
+    for (int i = 0; i < 3; i++)
+        for (int j = i; j < 3; j++)
+        {
+            is >> information()(i, j);
+            if (i != j)
+                information()(j, i) = information()(i, j);
+        }
+    return true;
+}
+
+bool EdgeSE3XYZRGBDOnlyPose::write(std::ostream &os) const
+{
+
+    for (int i = 0; i < 3; i++)
+    {
+        os << measurement()[i] << " ";
+    }
+
+    for (int i = 0; i < 3; i++)
+        for (int j = i; j < 3; j++)
+        {
+            os << " " << information()(i, j);
+        }
+    return os.good();
+}
+
+/**
+ * @brief 求解二维像素坐标关于位姿的雅克比矩阵 _jacobianOplusXi
+ */
+void EdgeSE3XYZRGBDOnlyPose::linearizeOplus()
+{
+    g2o::VertexSE3Expmap *vi = static_cast<g2o::VertexSE3Expmap *>(_vertices[0]);
+    Eigen::Vector3d xyz_trans = vi->estimate() * _point;
+
+    _jacobianOplusXi.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity();
+    _jacobianOplusXi.block<3, 3>(0, 3) = Sophus::SO3d::hat(xyz_trans);
+
+    
+}
+
 
 bool EdgeSE3ProjectXYZOnlyPoseToBody::read(std::istream &is)
 {

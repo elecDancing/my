@@ -267,10 +267,10 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
         mpTracker->SetPointCloudMapper(mpPointCloudMapping);
     }
 
-    //usleep(10*1000*1000);
-
-    //Initialize the Viewer thread and launch
-    // 创建并开启显示线程
+    // //usleep(10*1000*1000);
+    // //! 这里我关闭了建图线程
+    // //Initialize the Viewer thread and launch
+    // // 创建并开启显示线程
     if(bUseViewer)
     //if(false) // TODO
     {

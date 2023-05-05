@@ -60,6 +60,29 @@ public:
     GeometricCamera *pCamera;
 };
 
+//!rgbd模式自己写的误差计算
+class EdgeSE3XYZRGBDOnlyPose : public g2o::BaseUnaryEdge<3, Eigen::Vector3d, g2o::VertexSE3Expmap>{
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    EdgeSE3XYZRGBDOnlyPose(const Eigen::Vector3d &point) : _point(point) {}
+    bool read(std::istream &is);
+    bool write(std::ostream &os) const;
+
+    void computeError()
+    {
+        const g2o::VertexSE3Expmap *v1 = static_cast<const g2o::VertexSE3Expmap *>(_vertices[0]);
+        Eigen::Vector3d obs(_measurement);
+        //v1->estimate()为世界坐标系下三维点的坐标
+        _error = obs - v1->estimate() * _point;
+    }
+    virtual void linearizeOplus();
+    Eigen::Vector3d Xw;
+    GeometricCamera *pCamera;
+protected:
+  Eigen::Vector3d _point;
+};
+
 // 两个相机中的右目上的重投影误差与左目位姿的边
 class EdgeSE3ProjectXYZOnlyPoseToBody : public g2o::BaseUnaryEdge<2, Eigen::Vector2d, g2o::VertexSE3Expmap>
 {
