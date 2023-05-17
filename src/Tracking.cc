@@ -3212,6 +3212,7 @@ bool Tracking::TrackReferenceKeyFrame()
     // cout << " TrackReferenceKeyFrame mLastFrame.mTcw:  " << mLastFrame.mTcw << endl;
     // Step 4:通过优化3D-2D的重投影误差来获得位姿
     Optimizer::PoseOptimization(&mCurrentFrame);
+    //Optimizer::PoseOptimizationOnlyforRGBD(&mCurrentFrame);
 
     // Discard outliers
     // Step 5：剔除优化后的匹配点中的外点
@@ -3426,7 +3427,7 @@ bool Tracking::TrackWithMotionModel()
     // Optimize frame pose with all matches
     // Step 4：利用3D-2D投影关系，优化当前帧位姿
     Optimizer::PoseOptimization(&mCurrentFrame);
-
+    //Optimizer::PoseOptimizationOnlyforRGBD(&mCurrentFrame);
     // Discard outliers
     // Step 5：剔除地图点中外点
     int nmatchesMap = 0;
@@ -3514,13 +3515,15 @@ bool Tracking::TrackLocalMap()
     if (!mpAtlas->isImuInitialized())
         //!局部建图线程中的局部地图优化
         Optimizer::PoseOptimization(&mCurrentFrame);
+        //Optimizer::PoseOptimizationOnlyforRGBD(&mCurrentFrame);
     else
     {
         // 初始化，重定位，重新开启一个地图都会使mnLastRelocFrameId变化
         if(mCurrentFrame.mnId<=mnLastRelocFrameId+mnFramesToResetIMU)
         {
             Verbose::PrintMess("TLM: PoseOptimization ", Verbose::VERBOSITY_DEBUG);
-            Optimizer::PoseOptimization(&mCurrentFrame);
+            //Optimizer::PoseOptimization(&mCurrentFrame);
+            //Optimizer::PoseOptimizationOnlyforRGBD(&mCurrentFrame);
         }
         else  // 如果积累的IMU数据量比较多，考虑使用IMU数据优化
         {

@@ -4,7 +4,7 @@
  * @Author: xp.Zhang
  * @Date: 2023-04-30 20:34:01
  * @LastEditors: xp.Zhang
- * @LastEditTime: 2023-05-03 18:08:44
+ * @LastEditTime: 2023-05-17 16:52:00
 -->
 
 ## 修改的代码上传过程
@@ -25,6 +25,8 @@ git push origin MY_modified:record1
 
 ```
 ./Examples/RGB-D/rgbd_tum ./Vocabulary/ORBvoc.txt ./Examples/RGB-D/TUM1.yaml /home/juo/TUM/rgbd_dataset_freiburg1_desk ./Examples/RGB-D/associations/fr1_desk.txt
+
+./Examples/RGB-D/rgbd_tum ./Vocabulary/ORBvoc.txt ./Examples/RGB-D/TUM1.yaml /home/juo/TUM/rgbd_dataset_freiburg2_large_with_loop ./Examples/RGB-D/associations/fr2_large_loop.txt 
 ```
 
 ### 报错 没有将VTK 加载到环境变量中
@@ -52,3 +54,11 @@ source ~/.bashrc
 
 <img src="./photos/3.png" style="zoom: 100%;" />
 
+evo_ape tum ./CameraTrajectory.txt ./groundtruth.txt -va -s -p --plot_mode=xyz
+evo_traj tum ./CameraTrajectory.txt --ref=./groundtruth.txt -va -s -p --plot_mode=xyz
+
+数据对齐
+```
+python associate.py ./rgbd_dataset_freiburg2_large_with_loop/rgb.txt ./rgbd_dataset_freiburg2_large_with_loop/depth.txt > fr2_large_loop.txt
+
+```

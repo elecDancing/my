@@ -206,6 +206,7 @@ void LocalMapping::Run()
 						// 局部地图BA，不包括IMU数据
 						// 注意这里的第二个参数是按地址传递的,当这里的 mbAbortBA 状态发生变化时，能够及时执行/停止BA
                         // 局部地图优化，不包括IMU信息。优化关键帧位姿、地图点
+                        //!std::cout << "程序运行到了这里" << std::endl;
                         Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,&mbAbortBA, mpCurrentKeyFrame->GetMap(),num_FixedKF_BA,num_OptKF_BA,num_MPs_BA,num_edges_BA);
                         b_doneLBA = true;
                     }

@@ -1,4 +1,12 @@
 /*
+ * @Descripttion: 
+ * @version: 
+ * @Author: xp.Zhang
+ * @Date: 2023-04-30 20:10:07
+ * @LastEditors: xp.Zhang
+ * @LastEditTime: 2023-05-17 17:16:58
+ */
+/*
  * <one line to give the program's name and a brief idea of what it does.>
  * Copyright (C) 2016  <copyright holder> <email>
  * 
@@ -82,7 +90,13 @@ protected:
     std::mutex keyframeMutex;
     std::mutex updateMutex;
     uint16_t lastKeyframeSize = 0;
+    //体素网格过滤器的分辨率
+    /* 在 PCL 中，`resolution` 和 `leaf_size` 实际上是等价的。`resolution` 是用于表达体素网格分辨率的参数，表示每个体素的大小，而 `leaf_size` 则是表示体素网格边长的参数，即每个体素在 x、y 和 z 方向上的长度。
 
+PCL 中的体素网格过滤器使用 `leaf_size` 参数来指定体素的大小，从而控制体素网格的分辨率。当 `leaf_size` 值较小时，体素网格的分辨率会变得更高，因为每个体素包含的点数更少。反之，当 `leaf_size` 值较大时，体素网格的分辨率会变得更低，因为每个体素包含的点数更多。
+
+因此，可以通过调整 `resolution` 或 `leaf_size` 的值来控制体素网格过滤器的分辨率。在 PCL 中，通常使用 `setLeafSize()` 方法来设置体素网格过滤器的 `leaf_size` 值，而不是直接设置 `resolution`。 */
+    //!double resolution = 0.04;
     double resolution = 0.04;
     double meank = 50;
     double thresh = 1;
