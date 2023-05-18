@@ -4,7 +4,7 @@
  * @Author: xp.Zhang
  * @Date: 2023-04-30 20:10:07
  * @LastEditors: xp.Zhang
- * @LastEditTime: 2023-05-17 17:16:58
+ * @LastEditTime: 2023-05-18 16:57:03
  */
 /*
  * <one line to give the program's name and a brief idea of what it does.>
@@ -97,7 +97,7 @@ PCL 中的体素网格过滤器使用 `leaf_size` 参数来指定体素的大小
 
 因此，可以通过调整 `resolution` 或 `leaf_size` 的值来控制体素网格过滤器的分辨率。在 PCL 中，通常使用 `setLeafSize()` 方法来设置体素网格过滤器的 `leaf_size` 值，而不是直接设置 `resolution`。 */
     //!double resolution = 0.04;
-    double resolution = 0.04;
+    double resolution = 10;
     double meank = 50;
     double thresh = 1;
     pcl::VoxelGrid<pcl::PointXYZRGBA> *voxel;

@@ -118,6 +118,7 @@ public:
 
 
 // 左目纯位姿优化的边，左目点的重投影误差相对于左目位姿以及三维点
+//!局部建图 对每一对关联的MapPoint和KeyFrame构建边
 class EdgeSE3ProjectXYZ : public g2o::BaseBinaryEdge<2, Eigen::Vector2d, g2o::VertexSBAPointXYZ, g2o::VertexSE3Expmap>
 {
 public:
@@ -131,10 +132,17 @@ public:
 
     void computeError()
     {
+        //!第一个顶点是位姿
         const g2o::VertexSE3Expmap *v1 = static_cast<const g2o::VertexSE3Expmap *>(_vertices[1]);
+        //!第二个顶点是三维点
         const g2o::VertexSBAPointXYZ *v2 = static_cast<const g2o::VertexSBAPointXYZ *>(_vertices[0]);
         Eigen::Vector2d obs(_measurement);
         _error = obs - pCamera->project(v1->estimate().map(v2->estimate()));
+        /* 
+        * v2 是地图点的估计值，是世界坐标系下的三维点的坐标
+        * map将地图点映射到按照v1位姿转换到相机坐标系下
+        * project将相机坐标系下的三维点转换到像素坐标系
+         * */
     }
 
     bool isDepthPositive()

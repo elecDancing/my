@@ -179,7 +179,7 @@ void EdgeSE3ProjectXYZOnlyPoseToBody::linearizeOplus()
     */
     _jacobianOplusXi = -pCamera->projectJac(X_r) * mTrl.rotation().toRotationMatrix() * SE3deriv;
 }
-
+//!边的定义
 EdgeSE3ProjectXYZ::EdgeSE3ProjectXYZ() : BaseBinaryEdge<2, Eigen::Vector2d, g2o::VertexSBAPointXYZ, g2o::VertexSE3Expmap>()
 {
 }

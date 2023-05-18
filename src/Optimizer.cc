@@ -1731,6 +1731,20 @@ Eigen::MatrixXd Optimizer::Marginalize(const Eigen::MatrixXd &H, const int &star
 
 /**
  * @brief Local Bundle Adjustment LocalMapping::Run() 使用，纯视觉
+ * 1. Vertex:
+ *     - g2o::VertexSE3Expmap()，LocalKeyFrames，即当前关键帧的位姿、与当前关键帧相连的关键帧的位姿
+ *     - g2o::VertexSE3Expmap()，FixedCameras，即能观测到LocalMapPoints的关键帧（并且不属于LocalKeyFrames）的位姿，在优化中这些关键帧的位姿不变
+ *     - g2o::VertexSBAPointXYZ()，LocalMapPoints，即LocalKeyFrames能观测到的所有MapPoints的位置
+ * 2. Edge:
+ *     - g2o::EdgeSE3ProjectXYZ()，BaseBinaryEdge
+ *         + Vertex：关键帧的Tcw，MapPoint的Pw
+ *         + measurement：MapPoint在关键帧中的二维位置(u,v)
+ *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
+ *     - g2o::EdgeStereoSE3ProjectXYZ()，BaseBinaryEdge
+ *         + Vertex：关键帧的Tcw，MapPoint的Pw
+ *         + measurement：MapPoint在关键帧中的二维位置(ul,v,ur)
+ *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
+ * 
  * @param pKF        KeyFrame
  * @param pbStopFlag 是否停止优化的标志
  * @param pMap       在优化后，更新状态时需要用到Map的互斥量mMutexMapUpdate
@@ -1739,456 +1753,482 @@ Eigen::MatrixXd Optimizer::Marginalize(const Eigen::MatrixXd &H, const int &star
  * 总结下与ORBSLAM2的不同
  * 前面操作基本一样，但优化时2代去掉了误差大的点又进行优化了，3代只是统计但没有去掉继续优化，而后都是将误差大的点干掉
  */
-void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int &num_fixedKF, int &num_OptKF, int &num_MPs, int &num_edges)
-{
-    // 该优化函数用于LocalMapping线程的局部BA优化
-    // Local KeyFrames: First Breath Search from Current Keyframe
-    list<KeyFrame *> lLocalKeyFrames;
-
-    // 步骤1：将当前关键帧加入lLocalKeyFrames
-    lLocalKeyFrames.push_back(pKF);
-    pKF->mnBALocalForKF = pKF->mnId;
-    Map *pCurrentMap = pKF->GetMap();
-
-    // 步骤2：找到关键帧连接的关键帧（一级相连），加入lLocalKeyFrames中
-    const vector<KeyFrame *> vNeighKFs = pKF->GetVectorCovisibleKeyFrames();
-    for (int i = 0, iend = vNeighKFs.size(); i < iend; i++)
-    {
-        KeyFrame *pKFi = vNeighKFs[i];
-        // 记录局部优化id，该数为不断变化，数值等于局部化的关键帧的id，该id用于防止重复添加
-        pKFi->mnBALocalForKF = pKF->mnId;
-        if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
-            lLocalKeyFrames.push_back(pKFi);
-    }
-
-    // Local MapPoints seen in Local KeyFrames
-    num_fixedKF = 0;
-    // 步骤3：遍历lLocalKeyFrames中关键帧，将它们观测的MapPoints加入到lLocalMapPoints
-    list<MapPoint *> lLocalMapPoints;
-    set<MapPoint *> sNumObsMP;
-    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
-    {
-        KeyFrame *pKFi = *lit;
-        if (pKFi->mnId == pMap->GetInitKFid())
-        {
-            num_fixedKF = 1;
-        }
-        vector<MapPoint *> vpMPs = pKFi->GetMapPointMatches();
-        for (vector<MapPoint *>::iterator vit = vpMPs.begin(), vend = vpMPs.end(); vit != vend; vit++)
-        {
-            MapPoint *pMP = *vit;
-            if (pMP)
-                if (!pMP->isBad() && pMP->GetMap() == pCurrentMap)
-                {
-
-                    if (pMP->mnBALocalForKF != pKF->mnId)
-                    {
-                        lLocalMapPoints.push_back(pMP);
-                        pMP->mnBALocalForKF = pKF->mnId;
-                    }
-                }
-        }
-    }
-
-    // Fixed Keyframes. Keyframes that see Local MapPoints but that are not Local Keyframes
-    // 步骤4：得到能被局部MapPoints观测到，但不属于局部关键帧的关键帧，这些关键帧在局部BA优化时不优化
-    list<KeyFrame *> lFixedCameras;
-    for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
-    {
-        map<KeyFrame *, tuple<int, int>> observations = (*lit)->GetObservations();
-        for (map<KeyFrame *, tuple<int, int>>::iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
-        {
-            KeyFrame *pKFi = mit->first;
-
-            if (pKFi->mnBALocalForKF != pKF->mnId && pKFi->mnBAFixedForKF != pKF->mnId)
-            {
-                pKFi->mnBAFixedForKF = pKF->mnId;
-                if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
-                    lFixedCameras.push_back(pKFi);
-            }
-        }
-    }
-    // 步骤4.1：相比ORBSLAM2多出了判断固定关键帧的个数，最起码要两个固定的,如果实在没有就把lLocalKeyFrames中最早的KF固定，还是不够再加上第二早的KF固定
-    num_fixedKF = lFixedCameras.size() + num_fixedKF;
-
-    // 1.0 版本没有以下这段
-    // if (num_fixedKF < 2)
-    // {
-    //     std::cout << "程序运行到了Optimizer.cc中的第1876行" << std::endl;
-    //     list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin();
-    //     int lowerId = pKF->mnId;
-    //     KeyFrame *pLowerKf;
-    //     int secondLowerId = pKF->mnId;
-    //     KeyFrame *pSecondLowerKF;
-
-    //     for (; lit != lLocalKeyFrames.end(); lit++)
-    //     {
-    //         KeyFrame *pKFi = *lit;
-    //         if (pKFi == pKF || pKFi->mnId == pMap->GetInitKFid())
-    //         {
-    //             continue;
-    //         }
-
-    //         if (pKFi->mnId < lowerId)
-    //         {
-    //             lowerId = pKFi->mnId;
-    //             pLowerKf = pKFi;
-    //         }
-    //         else if (pKFi->mnId < secondLowerId)
-    //         {
-    //             secondLowerId = pKFi->mnId;
-    //             pSecondLowerKF = pKFi;
-    //         }
-    //     }
-    //     lFixedCameras.push_back(pLowerKf);
-    //     lLocalKeyFrames.remove(pLowerKf);
-    //     num_fixedKF++;
-    //     if (num_fixedKF < 2)
-    //     {
-    //         lFixedCameras.push_back(pSecondLowerKF);
-    //         lLocalKeyFrames.remove(pSecondLowerKF);
-    //         num_fixedKF++;
-    //     }
-    // }
-
-    if (num_fixedKF == 0)
-    {
-        Verbose::PrintMess("LM-LBA: There are 0 fixed KF in the optimizations, LBA aborted", Verbose::VERBOSITY_NORMAL);
-        return;
-    }
-
-    // Setup optimizer
-    // 步骤5：构造g2o优化器
-    g2o::SparseOptimizer optimizer;
-    g2o::BlockSolver_6_3::LinearSolverType *linearSolver;
-
-    linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
-
-    g2o::BlockSolver_6_3 *solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
-
-    g2o::OptimizationAlgorithmLevenberg *solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
-    if (pMap->IsInertial())
-        solver->setUserLambdaInit(100.0);
-
-    optimizer.setAlgorithm(solver);
-    optimizer.setVerbose(false);
-
-    if (pbStopFlag)
-        optimizer.setForceStopFlag(pbStopFlag);
-
-    unsigned long maxKFid = 0;
-
-    // DEBUG LBA
-    pCurrentMap->msOptKFs.clear();
-    pCurrentMap->msFixedKFs.clear();
-
-    // Set Local KeyFrame vertices
-    // 步骤6：添加顶点：Pose of Local KeyFrame
-    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
-    {
-        KeyFrame *pKFi = *lit;
-        g2o::VertexSE3Expmap *vSE3 = new g2o::VertexSE3Expmap();
-        Sophus::SE3<float> Tcw = pKFi->GetPose();
-        vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
-        vSE3->setId(pKFi->mnId);
-        vSE3->setFixed(pKFi->mnId == pMap->GetInitKFid());
-        optimizer.addVertex(vSE3);
-        if (pKFi->mnId > maxKFid)
-            maxKFid = pKFi->mnId;
-        // DEBUG LBA
-        pCurrentMap->msOptKFs.insert(pKFi->mnId);
-    }
-    num_OptKF = lLocalKeyFrames.size();
-
-    // Set Fixed KeyFrame vertices
-    // 步骤7：添加顶点：Pose of Fixed KeyFrame，注意这里调用了vSE3->setFixed(true)。
-    for (list<KeyFrame *>::iterator lit = lFixedCameras.begin(), lend = lFixedCameras.end(); lit != lend; lit++)
-    {
-        KeyFrame *pKFi = *lit;
-        g2o::VertexSE3Expmap *vSE3 = new g2o::VertexSE3Expmap();
-        Sophus::SE3<float> Tcw = pKFi->GetPose();
-        vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
-        vSE3->setId(pKFi->mnId);
-        vSE3->setFixed(true);
-        optimizer.addVertex(vSE3);
-        if (pKFi->mnId > maxKFid)
-            maxKFid = pKFi->mnId;
-        // DEBUG LBA
-        pCurrentMap->msFixedKFs.insert(pKFi->mnId);
-    }
-
-    // Set MapPoint vertices
-    // 步骤7：添加3D顶点
-    // 存放的方式(举例)
-    // 边id: 1 2 3 4 5 6 7 8 9
-    // KFid: 1 2 3 4 1 2 3 2 3
-    // MPid: 1 1 1 1 2 2 2 3 3
-    // 所以这个个数大约是点数×帧数，实际肯定比这个要少
-    const int nExpectedSize = (lLocalKeyFrames.size() + lFixedCameras.size()) * lLocalMapPoints.size();
-
-    // 存放单目时的边
-    vector<ORB_SLAM3::EdgeSE3ProjectXYZ *> vpEdgesMono;
-    vpEdgesMono.reserve(nExpectedSize);
-    // 存放双目鱼眼时另一个相机的边
-    vector<ORB_SLAM3::EdgeSE3ProjectXYZToBody *> vpEdgesBody;
-    vpEdgesBody.reserve(nExpectedSize);
-    // 存放单目时的KF
-    vector<KeyFrame *> vpEdgeKFMono;
-    vpEdgeKFMono.reserve(nExpectedSize);
-    // 存放单目时的MP
-
-    // 存放双目鱼眼时另一个相机的KF
-    vector<KeyFrame *> vpEdgeKFBody;
-    vpEdgeKFBody.reserve(nExpectedSize);
-    // 存放单目时的MP
-    vector<MapPoint *> vpMapPointEdgeMono;
-    vpMapPointEdgeMono.reserve(nExpectedSize);
-    // 存放双目鱼眼时另一个相机的MP
-    vector<MapPoint *> vpMapPointEdgeBody;
-    vpMapPointEdgeBody.reserve(nExpectedSize);
-
-    // 存放双目时的边
-    vector<g2o::EdgeStereoSE3ProjectXYZ *> vpEdgesStereo;
-    vpEdgesStereo.reserve(nExpectedSize);
-    // 存放双目时的KF
-    vector<KeyFrame *> vpEdgeKFStereo;
-    vpEdgeKFStereo.reserve(nExpectedSize);
-    // 存放双目时的MP
-    vector<MapPoint *> vpMapPointEdgeStereo;
-    vpMapPointEdgeStereo.reserve(nExpectedSize);
-
-    const float thHuberMono = sqrt(5.991);
-    const float thHuberStereo = sqrt(7.815);
-
-    int nPoints = 0;
-
-    int nEdges = 0;
-
-    // 添加顶点：MapPoint
-    for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
-    {
-        MapPoint *pMP = *lit;
-        g2o::VertexSBAPointXYZ *vPoint = new g2o::VertexSBAPointXYZ();
-        vPoint->setEstimate(pMP->GetWorldPos().cast<double>());
-        int id = pMP->mnId + maxKFid + 1;
-        vPoint->setId(id);
-        // 这里的边缘化与滑动窗口不同，而是为了加速稀疏矩阵的计算BlockSolver_6_3默认了6维度的不边缘化，3自由度的三维点被边缘化，所以所有三维点都设置边缘化
-        vPoint->setMarginalized(true);
-        optimizer.addVertex(vPoint);
-        nPoints++;
-
-        const map<KeyFrame *, tuple<int, int>> observations = pMP->GetObservations();
-
-        // Set edges
-        //  步骤8：对每一对关联的MapPoint和KeyFrame构建边
-        for (map<KeyFrame *, tuple<int, int>>::const_iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
-        {
-            KeyFrame *pKFi = mit->first;
-
-            if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
-            {
-                const int leftIndex = get<0>(mit->second);
-
-                // Monocular observation
-                // 单目
-                if (leftIndex != -1 && pKFi->mvuRight[get<0>(mit->second)] < 0)
-                {
-                    const cv::KeyPoint &kpUn = pKFi->mvKeysUn[leftIndex];
-                    Eigen::Matrix<double, 2, 1> obs;
-                    obs << kpUn.pt.x, kpUn.pt.y;
-
-                    ORB_SLAM3::EdgeSE3ProjectXYZ *e = new ORB_SLAM3::EdgeSE3ProjectXYZ();
-
-                    e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
-                    e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
-                    e->setMeasurement(obs);
-                    const float &invSigma2 = pKFi->mvInvLevelSigma2[kpUn.octave];
-                    e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
-
-                    g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
-                    e->setRobustKernel(rk);
-                    rk->setDelta(thHuberMono);
-
-                    e->pCamera = pKFi->mpCamera;
-
-                    optimizer.addEdge(e);
-                    vpEdgesMono.push_back(e);
-                    vpEdgeKFMono.push_back(pKFi);
-                    vpMapPointEdgeMono.push_back(pMP);
-
-                    nEdges++;
-                }
-                else if (leftIndex != -1 && pKFi->mvuRight[get<0>(mit->second)] >= 0) // Stereo observation
-                {
-                    const cv::KeyPoint &kpUn = pKFi->mvKeysUn[leftIndex];
-                    Eigen::Matrix<double, 3, 1> obs;
-                    const float kp_ur = pKFi->mvuRight[get<0>(mit->second)];
-                    obs << kpUn.pt.x, kpUn.pt.y, kp_ur;
-
-                    g2o::EdgeStereoSE3ProjectXYZ *e = new g2o::EdgeStereoSE3ProjectXYZ();
-
-                    e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
-                    e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
-                    e->setMeasurement(obs);
-                    const float &invSigma2 = pKFi->mvInvLevelSigma2[kpUn.octave];
-                    Eigen::Matrix3d Info = Eigen::Matrix3d::Identity() * invSigma2;
-                    e->setInformation(Info);
-
-                    g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
-                    e->setRobustKernel(rk);
-                    rk->setDelta(thHuberStereo);
-
-                    e->fx = pKFi->fx;
-                    e->fy = pKFi->fy;
-                    e->cx = pKFi->cx;
-                    e->cy = pKFi->cy;
-                    e->bf = pKFi->mbf;
-
-                    optimizer.addEdge(e);
-                    vpEdgesStereo.push_back(e);
-                    vpEdgeKFStereo.push_back(pKFi);
-                    vpMapPointEdgeStereo.push_back(pMP);
-
-                    nEdges++;
-                }
-
-                if (pKFi->mpCamera2)
-                {
-                    int rightIndex = get<1>(mit->second);
-
-                    if (rightIndex != -1)
-                    {
-                        rightIndex -= pKFi->NLeft;
-
-                        Eigen::Matrix<double, 2, 1> obs;
-                        cv::KeyPoint kp = pKFi->mvKeysRight[rightIndex];
-                        obs << kp.pt.x, kp.pt.y;
-
-                        ORB_SLAM3::EdgeSE3ProjectXYZToBody *e = new ORB_SLAM3::EdgeSE3ProjectXYZToBody();
-
-                        e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
-                        e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
-                        e->setMeasurement(obs);
-                        const float &invSigma2 = pKFi->mvInvLevelSigma2[kp.octave];
-                        e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
-
-                        g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
-                        e->setRobustKernel(rk);
-                        rk->setDelta(thHuberMono);
-
-                        Sophus::SE3f Trl = pKFi->GetRelativePoseTrl();
-                        e->mTrl = g2o::SE3Quat(Trl.unit_quaternion().cast<double>(), Trl.translation().cast<double>());
-
-                        e->pCamera = pKFi->mpCamera2;
-
-                        optimizer.addEdge(e);
-                        vpEdgesBody.push_back(e);
-                        vpEdgeKFBody.push_back(pKFi);
-                        vpMapPointEdgeBody.push_back(pMP);
-
-                        nEdges++;
-                    }
-                }
-            }
-        }
-    }
-    num_edges = nEdges;
-
-    if (pbStopFlag)
-        if (*pbStopFlag)
-            return;
-
-    // 步骤9：开始优化
-    optimizer.initializeOptimization();
-    optimizer.optimize(10);
-
-    vector<pair<KeyFrame *, MapPoint *>> vToErase;
-    vToErase.reserve(vpEdgesMono.size() + vpEdgesBody.size() + vpEdgesStereo.size());
-
-    // Check inlier observations
-    // 步骤10：在优化后重新计算误差，剔除连接误差比较大的关键帧和MapPoint
-    for (size_t i = 0, iend = vpEdgesMono.size(); i < iend; i++)
-    {
-        ORB_SLAM3::EdgeSE3ProjectXYZ *e = vpEdgesMono[i];
-        MapPoint *pMP = vpMapPointEdgeMono[i];
-
-        if (pMP->isBad())
-            continue;
-
-        if (e->chi2() > 5.991 || !e->isDepthPositive())
-        {
-            KeyFrame *pKFi = vpEdgeKFMono[i];
-            vToErase.push_back(make_pair(pKFi, pMP));
-        }
-    }
-
-    for (size_t i = 0, iend = vpEdgesBody.size(); i < iend; i++)
-    {
-        ORB_SLAM3::EdgeSE3ProjectXYZToBody *e = vpEdgesBody[i];
-        MapPoint *pMP = vpMapPointEdgeBody[i];
-
-        if (pMP->isBad())
-            continue;
-
-        if (e->chi2() > 5.991 || !e->isDepthPositive())
-        {
-            KeyFrame *pKFi = vpEdgeKFBody[i];
-            vToErase.push_back(make_pair(pKFi, pMP));
-        }
-    }
-
-    for (size_t i = 0, iend = vpEdgesStereo.size(); i < iend; i++)
-    {
-        g2o::EdgeStereoSE3ProjectXYZ *e = vpEdgesStereo[i];
-        MapPoint *pMP = vpMapPointEdgeStereo[i];
-
-        if (pMP->isBad())
-            continue;
-
-        if (e->chi2() > 7.815 || !e->isDepthPositive())
-        {
-            KeyFrame *pKFi = vpEdgeKFStereo[i];
-            vToErase.push_back(make_pair(pKFi, pMP));
-        }
-    }
-
-    // Get Map Mutex
-    unique_lock<mutex> lock(pMap->mMutexMapUpdate);
-
-    if (!vToErase.empty())
-    {
-        for (size_t i = 0; i < vToErase.size(); i++)
-        {
-            KeyFrame *pKFi = vToErase[i].first;
-            MapPoint *pMPi = vToErase[i].second;
-            pKFi->EraseMapPointMatch(pMPi);
-            pMPi->EraseObservation(pKFi);
-        }
-    }
-
-    // Recover optimized data
-    // Keyframes
-    bool bShowStats = false;
-    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
-    {
-        KeyFrame *pKFi = *lit;
-        g2o::VertexSE3Expmap *vSE3 = static_cast<g2o::VertexSE3Expmap *>(optimizer.vertex(pKFi->mnId));
-        g2o::SE3Quat SE3quat = vSE3->estimate();
-        Sophus::SE3f Tiw(SE3quat.rotation().cast<float>(), SE3quat.translation().cast<float>());
-        pKFi->SetPose(Tiw);
-    }
-
-    // Points
-    for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
-    {
-        MapPoint *pMP = *lit;
-        g2o::VertexSBAPointXYZ *vPoint = static_cast<g2o::VertexSBAPointXYZ *>(optimizer.vertex(pMP->mnId + maxKFid + 1));
-        pMP->SetWorldPos(vPoint->estimate().cast<float>());
-        pMP->UpdateNormalAndDepth();
-    }
-
-    pMap->IncreaseChangeIndex();
-}
+// void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int &num_fixedKF, int &num_OptKF, int &num_MPs, int &num_edges)
+// {
+//     // 该优化函数用于LocalMapping线程的局部BA优化
+//     // Local KeyFrames: First Breath Search from Current Keyframe
+//     //!这里面的是当前关键帧和其共视关键帧
+//     list<KeyFrame *> lLocalKeyFrames;
+
+//     // 步骤1：将当前关键帧加入lLocalKeyFrames
+//     lLocalKeyFrames.push_back(pKF);
+//     pKF->mnBALocalForKF = pKF->mnId;
+//     Map *pCurrentMap = pKF->GetMap();
+
+//     // 步骤2：找到关键帧连接的关键帧（一级相连），加入lLocalKeyFrames中
+//     //!这一步找到了所有能够共视的关键帧
+//     const vector<KeyFrame *> vNeighKFs = pKF->GetVectorCovisibleKeyFrames();
+//     for (int i = 0, iend = vNeighKFs.size(); i < iend; i++)
+//     {
+//         KeyFrame *pKFi = vNeighKFs[i];
+//         // 记录局部优化id，该数为不断变化，数值等于局部化的关键帧的id，该id用于防止重复添加
+//         pKFi->mnBALocalForKF = pKF->mnId;
+//         //!保证该关键帧有效才能加入
+//         if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
+//             lLocalKeyFrames.push_back(pKFi);
+//     }
+
+//     // Local MapPoints seen in Local KeyFrames
+//     num_fixedKF = 0;
+//     // 步骤3：遍历lLocalKeyFrames中关键帧，将它们观测的MapPoints加入到lLocalMapPoints
+//     list<MapPoint *> lLocalMapPoints;
+//     set<MapPoint *> sNumObsMP;
+//     //!遍历1LocalKeyFrames中的每一个关键帧
+//     for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+//     {
+//         KeyFrame *pKFi = *lit;
+//         if (pKFi->mnId == pMap->GetInitKFid())
+//         {
+//             num_fixedKF = 1;
+//         }
+//         //!取出该关键帧对应的地图点集合
+//         vector<MapPoint *> vpMPs = pKFi->GetMapPointMatches();
+//         for (vector<MapPoint *>::iterator vit = vpMPs.begin(), vend = vpMPs.end(); vit != vend; vit++)
+//         {
+//             MapPoint *pMP = *vit;//!从地图点集合中选择一个点
+//             if (pMP)
+//                 if (!pMP->isBad() && pMP->GetMap() == pCurrentMap)//!保证地图点有效
+//                 {
+
+//                     if (pMP->mnBALocalForKF != pKF->mnId) //!防止地图点的重复添加
+//                     {
+//                         lLocalMapPoints.push_back(pMP); //!将地图点放到lLocalMapPoints里面
+//                         pMP->mnBALocalForKF = pKF->mnId;
+//                     }
+//                 }
+//         }
+//     }
+
+//     // Fixed Keyframes. Keyframes that see Local MapPoints but that are not Local Keyframes
+//     // 步骤4：得到能被局部MapPoints观测到，但不属于局部关键帧的关键帧，这些关键帧在局部BA优化时不优化
+//     list<KeyFrame *> lFixedCameras;
+//     //!遍历局部地图点
+//     for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
+//     {
+//         //!得到每个局部地图点对应的关键帧
+//         map<KeyFrame *, tuple<int, int>> observations = (*lit)->GetObservations();
+//         //!对于每个局部地图点对应的关键帧做判断
+//         for (map<KeyFrame *, tuple<int, int>>::iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
+//         {
+//             KeyFrame *pKFi = mit->first;
+//             // pKFi->mnBALocalForKF!=pKF->mnId 表示不属于局部关键帧，
+//             // pKFi->mnBAFixedForKF!=pKF->mnId 表示还未标记为fixed（固定的）关键帧
+//             if (pKFi->mnBALocalForKF != pKF->mnId && pKFi->mnBAFixedForKF != pKF->mnId)
+//             {
+//                 pKFi->mnBAFixedForKF = pKF->mnId;
+//                 if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
+//                     lFixedCameras.push_back(pKFi);
+//             }
+//         }
+//     }
+//     // 步骤4.1：相比ORBSLAM2多出了判断固定关键帧的个数，最起码要两个固定的,如果实在没有就把lLocalKeyFrames中最早的KF固定，还是不够再加上第二早的KF固定
+//     num_fixedKF = lFixedCameras.size() + num_fixedKF;
+
+//     // 1.0 版本没有以下这段
+//     // if (num_fixedKF < 2)
+//     // {
+//     //     std::cout << "程序运行到了Optimizer.cc中的第1876行" << std::endl;
+//     //     list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin();
+//     //     int lowerId = pKF->mnId;
+//     //     KeyFrame *pLowerKf;
+//     //     int secondLowerId = pKF->mnId;
+//     //     KeyFrame *pSecondLowerKF;
+
+//     //     for (; lit != lLocalKeyFrames.end(); lit++)
+//     //     {
+//     //         KeyFrame *pKFi = *lit;
+//     //         if (pKFi == pKF || pKFi->mnId == pMap->GetInitKFid())
+//     //         {
+//     //             continue;
+//     //         }
+
+//     //         if (pKFi->mnId < lowerId)
+//     //         {
+//     //             lowerId = pKFi->mnId;
+//     //             pLowerKf = pKFi;
+//     //         }
+//     //         else if (pKFi->mnId < secondLowerId)
+//     //         {
+//     //             secondLowerId = pKFi->mnId;
+//     //             pSecondLowerKF = pKFi;
+//     //         }
+//     //     }
+//     //     lFixedCameras.push_back(pLowerKf);
+//     //     lLocalKeyFrames.remove(pLowerKf);
+//     //     num_fixedKF++;
+//     //     if (num_fixedKF < 2)
+//     //     {
+//     //         lFixedCameras.push_back(pSecondLowerKF);
+//     //         lLocalKeyFrames.remove(pSecondLowerKF);
+//     //         num_fixedKF++;
+//     //     }
+//     // }
+
+//     if (num_fixedKF == 0)
+//     {
+//         Verbose::PrintMess("LM-LBA: There are 0 fixed KF in the optimizations, LBA aborted", Verbose::VERBOSITY_NORMAL);
+//         return;
+//     }
+
+//     // Setup optimizer
+//     // 步骤5：构造g2o优化器
+//     g2o::SparseOptimizer optimizer;
+//     g2o::BlockSolver_6_3::LinearSolverType *linearSolver;
+
+//     linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
+
+//     g2o::BlockSolver_6_3 *solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
+
+//     g2o::OptimizationAlgorithmLevenberg *solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+//     if (pMap->IsInertial())
+//         solver->setUserLambdaInit(100.0);
+
+//     optimizer.setAlgorithm(solver);
+//     optimizer.setVerbose(false);
+
+//     if (pbStopFlag)
+//         optimizer.setForceStopFlag(pbStopFlag);
+    
+//     //!开始之前先记录一下参与BA的最大关键帧ID
+//     unsigned long maxKFid = 0;
+
+//     // // DEBUG LBA
+//     // pCurrentMap->msOptKFs.clear();
+//     // pCurrentMap->msFixedKFs.clear();
+
+//     // Set Local KeyFrame vertices
+//     // 步骤6：添加顶点：Pose of Local KeyFrame 
+//     //!添加的是待优化的位姿的顶点
+//     for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+//     {
+//         KeyFrame *pKFi = *lit;
+//         g2o::VertexSE3Expmap *vSE3 = new g2o::VertexSE3Expmap();
+//         //!关键帧携带的初始位姿作为优化的初值
+//         Sophus::SE3<float> Tcw = pKFi->GetPose();
+//         vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
+
+//         vSE3->setId(pKFi->mnId);
+//         //!如果是初始关键帧，锁住位姿不优化
+//         vSE3->setFixed(pKFi->mnId == pMap->GetInitKFid());
+//         //!关键帧位姿加入顶点
+//         optimizer.addVertex(vSE3);
+
+//         if (pKFi->mnId > maxKFid)
+//             maxKFid = pKFi->mnId;
+//         // // DEBUG LBA
+//         // pCurrentMap->msOptKFs.insert(pKFi->mnId);
+//     }
+//     num_OptKF = lLocalKeyFrames.size();
+
+//     // Set Fixed KeyFrame vertices
+//     // 步骤7：添加顶点：Pose of Fixed KeyFrame，注意这里调用了vSE3->setFixed(true)。
+//     //!添加不优化的位姿顶点，为什么不优化也要添加呢，为了增加约束信息
+//     for (list<KeyFrame *>::iterator lit = lFixedCameras.begin(), lend = lFixedCameras.end(); lit != lend; lit++)
+//     {
+//         KeyFrame *pKFi = *lit;
+//         g2o::VertexSE3Expmap *vSE3 = new g2o::VertexSE3Expmap();
+//         Sophus::SE3<float> Tcw = pKFi->GetPose();
+//         vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
+//         vSE3->setId(pKFi->mnId);
+//         vSE3->setFixed(true);
+//         //!这些顶点的位姿都不优化，只是为了增加约束项
+//         optimizer.addVertex(vSE3);
+//         if (pKFi->mnId > maxKFid)
+//             maxKFid = pKFi->mnId;
+//         // // DEBUG LBA
+//         // pCurrentMap->msFixedKFs.insert(pKFi->mnId);
+//     }
+
+//     // Set MapPoint vertices
+//     // 步骤7：添加3D顶点
+//     //!添加优化的地图点
+//     // 存放的方式(举例)
+//     // 边id: 1 2 3 4 5 6 7 8 9
+//     // KFid: 1 2 3 4 1 2 3 2 3
+//     // MPid: 1 1 1 1 2 2 2 3 3
+//     // 所以这个个数大约是点数×帧数，实际肯定比这个要少
+//     //!初始化边的数目 = 帧数目 * 地图点的数目
+//     const int nExpectedSize = (lLocalKeyFrames.size() + lFixedCameras.size()) * lLocalMapPoints.size();
+
+//     //! 存放单目时的边
+//     vector<ORB_SLAM3::EdgeSE3ProjectXYZ *> vpEdgesMono;
+//     vpEdgesMono.reserve(nExpectedSize);
+//     // 存放双目鱼眼时另一个相机的边
+//     vector<ORB_SLAM3::EdgeSE3ProjectXYZToBody *> vpEdgesBody;
+//     vpEdgesBody.reserve(nExpectedSize);
+//     //! 存放单目时的KF
+//     vector<KeyFrame *> vpEdgeKFMono;
+//     vpEdgeKFMono.reserve(nExpectedSize);
+
+//     // 存放双目鱼眼时另一个相机的KF
+//     vector<KeyFrame *> vpEdgeKFBody;
+//     vpEdgeKFBody.reserve(nExpectedSize);
+//     //! 存放单目时的MP
+//     vector<MapPoint *> vpMapPointEdgeMono;
+//     vpMapPointEdgeMono.reserve(nExpectedSize);
+//     // 存放双目鱼眼时另一个相机的MP
+//     vector<MapPoint *> vpMapPointEdgeBody;
+//     vpMapPointEdgeBody.reserve(nExpectedSize);
+
+//     // 存放双目时的边
+//     vector<g2o::EdgeStereoSE3ProjectXYZ *> vpEdgesStereo;
+//     vpEdgesStereo.reserve(nExpectedSize);
+//     // 存放双目时的KF
+//     vector<KeyFrame *> vpEdgeKFStereo;
+//     vpEdgeKFStereo.reserve(nExpectedSize);
+//     // 存放双目时的MP
+//     vector<MapPoint *> vpMapPointEdgeStereo;
+//     vpMapPointEdgeStereo.reserve(nExpectedSize);
+
+//     //!鲁棒核函数防止误差过大
+//     const float thHuberMono = sqrt(5.991);
+//     const float thHuberStereo = sqrt(7.815);
+
+//     int nPoints = 0;
+
+//     int nEdges = 0;
+
+//     //! 添加顶点：MapPoint
+//     for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
+//     {
+//         MapPoint *pMP = *lit;
+//         g2o::VertexSBAPointXYZ *vPoint = new g2o::VertexSBAPointXYZ();
+//         vPoint->setEstimate(pMP->GetWorldPos().cast<double>());//!地图点的世界坐标系坐标设为初值
+//         int id = pMP->mnId + maxKFid + 1; //!在maxKFid 之后再设置地图点的ID
+//         vPoint->setId(id);
+//         //!由于使用了LinearSolverType， 所以需要将所有的三维点边缘化掉
+//         // 这里的边缘化与滑动窗口不同，而是为了加速稀疏矩阵的计算BlockSolver_6_3默认了6维度的不边缘化，3自由度的三维点被边缘化，所以所有三维点都设置边缘化
+//         vPoint->setMarginalized(true);
+//         optimizer.addVertex(vPoint);
+//         nPoints++;
+//         //观测到该地图点的关键帧，和该地图点在关键帧中的索引
+//         const map<KeyFrame *, tuple<int, int>> observations = pMP->GetObservations();
+
+//         // Set edges
+//         //!  步骤8：对每一对关联的MapPoint和KeyFrame构建边
+//         for (map<KeyFrame *, tuple<int, int>>::const_iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
+//         {
+//             KeyFrame *pKFi = mit->first;
+
+//             if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
+//             {
+//                 const int leftIndex = get<0>(mit->second);
+
+//                 // Monocular observation
+//                 // 单目
+//                 if (leftIndex != -1 && pKFi->mvuRight[get<0>(mit->second)] < 0)
+//                 {
+//                     const cv::KeyPoint &kpUn = pKFi->mvKeysUn[leftIndex];//!当前地图点对应的二维的特征点
+//                     Eigen::Matrix<double, 2, 1> obs;
+//                     obs << kpUn.pt.x, kpUn.pt.y; //!观测值
+//                     //!这里设置了边的形式
+//                     ORB_SLAM3::EdgeSE3ProjectXYZ *e = new ORB_SLAM3::EdgeSE3ProjectXYZ();
+//                     //!三维点
+//                     e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
+//                     //!初始估计位姿
+//                     e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
+//                     e->setMeasurement(obs);
+//                     //!边的权重的设置方式（信息矩阵）
+//                     //!权重为特征点所在的图像金字塔的层数的倒数，层数越高，该特征点的误差置信度越低
+//                     const float &invSigma2 = pKFi->mvInvLevelSigma2[kpUn.octave];
+//                     e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
+//                     //!用鲁棒核函数抑制外点
+//                     g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+//                     e->setRobustKernel(rk);
+//                     rk->setDelta(thHuberMono);
+
+//                     e->pCamera = pKFi->mpCamera;
+
+//                     optimizer.addEdge(e);
+//                     vpEdgesMono.push_back(e);
+//                     vpEdgeKFMono.push_back(pKFi);
+//                     vpMapPointEdgeMono.push_back(pMP);
+
+//                     nEdges++;
+//                 }
+//                 //双目的情况
+//                 else if (leftIndex != -1 && pKFi->mvuRight[get<0>(mit->second)] >= 0) // Stereo observation
+//                 {
+//                     const cv::KeyPoint &kpUn = pKFi->mvKeysUn[leftIndex];
+//                     Eigen::Matrix<double, 3, 1> obs;
+//                     const float kp_ur = pKFi->mvuRight[get<0>(mit->second)];
+//                     obs << kpUn.pt.x, kpUn.pt.y, kp_ur;
+
+//                     g2o::EdgeStereoSE3ProjectXYZ *e = new g2o::EdgeStereoSE3ProjectXYZ();
+
+//                     e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
+//                     e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
+//                     e->setMeasurement(obs);
+//                     const float &invSigma2 = pKFi->mvInvLevelSigma2[kpUn.octave];
+//                     Eigen::Matrix3d Info = Eigen::Matrix3d::Identity() * invSigma2;
+//                     e->setInformation(Info);
+
+//                     g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+//                     e->setRobustKernel(rk);
+//                     rk->setDelta(thHuberStereo);
+
+//                     e->fx = pKFi->fx;
+//                     e->fy = pKFi->fy;
+//                     e->cx = pKFi->cx;
+//                     e->cy = pKFi->cy;
+//                     e->bf = pKFi->mbf;
+
+//                     optimizer.addEdge(e);
+//                     vpEdgesStereo.push_back(e);
+//                     vpEdgeKFStereo.push_back(pKFi);
+//                     vpMapPointEdgeStereo.push_back(pMP);
+
+//                     nEdges++;
+//                 }
+
+//                 if (pKFi->mpCamera2)
+//                 {
+//                     int rightIndex = get<1>(mit->second);
+
+//                     if (rightIndex != -1)
+//                     {
+//                         rightIndex -= pKFi->NLeft;
+
+//                         Eigen::Matrix<double, 2, 1> obs;
+//                         cv::KeyPoint kp = pKFi->mvKeysRight[rightIndex];
+//                         obs << kp.pt.x, kp.pt.y;
+
+//                         ORB_SLAM3::EdgeSE3ProjectXYZToBody *e = new ORB_SLAM3::EdgeSE3ProjectXYZToBody();
+
+//                         e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
+//                         e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
+//                         e->setMeasurement(obs);
+//                         const float &invSigma2 = pKFi->mvInvLevelSigma2[kp.octave];
+//                         e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
+
+//                         g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+//                         e->setRobustKernel(rk);
+//                         rk->setDelta(thHuberMono);
+
+//                         Sophus::SE3f Trl = pKFi->GetRelativePoseTrl();
+//                         e->mTrl = g2o::SE3Quat(Trl.unit_quaternion().cast<double>(), Trl.translation().cast<double>());
+
+//                         e->pCamera = pKFi->mpCamera2;
+
+//                         optimizer.addEdge(e);
+//                         vpEdgesBody.push_back(e);
+//                         vpEdgeKFBody.push_back(pKFi);
+//                         vpMapPointEdgeBody.push_back(pMP);
+
+//                         nEdges++;
+//                     }
+//                 }
+//             }
+//         }
+//     }
+//     num_edges = nEdges;
+
+//     if (pbStopFlag)
+//         if (*pbStopFlag)
+//             return;
+
+//     //!步骤9：开始优化
+//     optimizer.initializeOptimization();
+//     optimizer.optimize(10);
+
+//     vector<pair<KeyFrame *, MapPoint *>> vToErase;
+//     vToErase.reserve(vpEdgesMono.size() + vpEdgesBody.size() + vpEdgesStereo.size());
+
+//     // Check inlier observations
+//     //! 步骤10：在优化后重新计算误差，剔除连接误差比较大的关键帧和MapPoint
+//     for (size_t i = 0, iend = vpEdgesMono.size(); i < iend; i++)
+//     {
+//         ORB_SLAM3::EdgeSE3ProjectXYZ *e = vpEdgesMono[i];
+//         MapPoint *pMP = vpMapPointEdgeMono[i];
+
+//         if (pMP->isBad())
+//             continue;
+
+//         if (e->chi2() > 5.991 || !e->isDepthPositive())
+//         {
+//             KeyFrame *pKFi = vpEdgeKFMono[i];
+//             vToErase.push_back(make_pair(pKFi, pMP));
+//         }
+//     }
+
+//     for (size_t i = 0, iend = vpEdgesBody.size(); i < iend; i++)
+//     {
+//         ORB_SLAM3::EdgeSE3ProjectXYZToBody *e = vpEdgesBody[i];
+//         MapPoint *pMP = vpMapPointEdgeBody[i];
+
+//         if (pMP->isBad())
+//             continue;
+
+//         if (e->chi2() > 5.991 || !e->isDepthPositive())
+//         {
+//             KeyFrame *pKFi = vpEdgeKFBody[i];
+//             vToErase.push_back(make_pair(pKFi, pMP));
+//         }
+//     }
+
+//     for (size_t i = 0, iend = vpEdgesStereo.size(); i < iend; i++)
+//     {
+//         g2o::EdgeStereoSE3ProjectXYZ *e = vpEdgesStereo[i];
+//         MapPoint *pMP = vpMapPointEdgeStereo[i];
+
+//         if (pMP->isBad())
+//             continue;
+
+//         if (e->chi2() > 7.815 || !e->isDepthPositive())
+//         {
+//             KeyFrame *pKFi = vpEdgeKFStereo[i];
+//             vToErase.push_back(make_pair(pKFi, pMP));
+//         }
+//     }
+
+//     // Get Map Mutex
+//     unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+//     //!删除点，在关键帧中剔除对该地图点的观测，在地图点中剔除对该关键帧的观测
+//     if (!vToErase.empty())
+//     {
+//         for (size_t i = 0; i < vToErase.size(); i++)
+//         {
+//             KeyFrame *pKFi = vToErase[i].first;
+//             MapPoint *pMPi = vToErase[i].second;
+//             pKFi->EraseMapPointMatch(pMPi);
+//             pMPi->EraseObservation(pKFi);
+//         }
+//     }
+
+//     // Recover optimized data
+//     // Keyframes
+//     //!优化后更新关键帧的位姿以及地图点的位置，平均观测方向
+//     bool bShowStats = false;
+//     for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+//     {
+//         KeyFrame *pKFi = *lit;
+//         g2o::VertexSE3Expmap *vSE3 = static_cast<g2o::VertexSE3Expmap *>(optimizer.vertex(pKFi->mnId));
+//         g2o::SE3Quat SE3quat = vSE3->estimate();
+//         Sophus::SE3f Tiw(SE3quat.rotation().cast<float>(), SE3quat.translation().cast<float>());
+//         pKFi->SetPose(Tiw);
+//     }
+
+//     // Points
+//     for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
+//     {
+//         MapPoint *pMP = *lit;
+//         g2o::VertexSBAPointXYZ *vPoint = static_cast<g2o::VertexSBAPointXYZ *>(optimizer.vertex(pMP->mnId + maxKFid + 1));
+//         pMP->SetWorldPos(vPoint->estimate().cast<float>());
+//         pMP->UpdateNormalAndDepth();
+//     }
+
+//     pMap->IncreaseChangeIndex();
+// }
 
 /**
  * @brief 局部地图＋惯导BA LocalMapping IMU中使用，地图经过imu初始化时用这个函数代替LocalBundleAdjustment
@@ -6904,6 +6944,8 @@ int Optimizer::PoseOptimizationOnlyforRGBD(Frame* pFrame){
     return nInitialCorrespondences - nBad;
 }
 
+
+
 /**************************************以下为局部地图优化（仅仅适合RGBD相机）**************************************************************/
 
 /**
@@ -7367,7 +7409,383 @@ void Optimizer::LocalBundleAdjustmentOnlyForRGBD(KeyFrame *pKF, bool *pbStopFlag
     pMap->IncreaseChangeIndex();
 }
 
+void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int &num_fixedKF, int &num_OptKF, int &num_MPs, int &num_edges)
+{
+    // 该优化函数用于LocalMapping线程的局部BA优化
+    // Local KeyFrames: First Breath Search from Current Keyframe
+    //!这里面的是当前关键帧和其共视关键帧
+    list<KeyFrame *> lLocalKeyFrames;
 
+    // 步骤1：将当前关键帧加入lLocalKeyFrames
+    lLocalKeyFrames.push_back(pKF);
+    pKF->mnBALocalForKF = pKF->mnId;
+    Map *pCurrentMap = pKF->GetMap();
+
+    // 步骤2：找到关键帧连接的关键帧（一级相连），加入lLocalKeyFrames中
+    //!这一步找到了所有能够共视的关键帧
+    const vector<KeyFrame *> vNeighKFs = pKF->GetVectorCovisibleKeyFrames();
+    for (int i = 0, iend = vNeighKFs.size(); i < iend; i++)
+    {
+        KeyFrame *pKFi = vNeighKFs[i];
+        // 记录局部优化id，该数为不断变化，数值等于局部化的关键帧的id，该id用于防止重复添加
+        pKFi->mnBALocalForKF = pKF->mnId;
+        //!保证该关键帧有效才能加入
+        if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
+            lLocalKeyFrames.push_back(pKFi);
+    }
+
+    // Local MapPoints seen in Local KeyFrames
+    num_fixedKF = 0;
+    // 步骤3：遍历lLocalKeyFrames中关键帧，将它们观测的MapPoints加入到lLocalMapPoints
+    list<MapPoint *> lLocalMapPoints;
+    set<MapPoint *> sNumObsMP;
+    //!遍历1LocalKeyFrames中的每一个关键帧
+    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+    {
+        KeyFrame *pKFi = *lit;
+        if (pKFi->mnId == pMap->GetInitKFid())
+        {
+            num_fixedKF = 1;
+        }
+        //!取出该关键帧对应的地图点集合
+        vector<MapPoint *> vpMPs = pKFi->GetMapPointMatches();
+        for (vector<MapPoint *>::iterator vit = vpMPs.begin(), vend = vpMPs.end(); vit != vend; vit++)
+        {
+            MapPoint *pMP = *vit;//!从地图点集合中选择一个点
+            if (pMP)
+                if (!pMP->isBad() && pMP->GetMap() == pCurrentMap)//!保证地图点有效
+                {
+
+                    if (pMP->mnBALocalForKF != pKF->mnId) //!防止地图点的重复添加
+                    {
+                        lLocalMapPoints.push_back(pMP); //!将地图点放到lLocalMapPoints里面
+                        pMP->mnBALocalForKF = pKF->mnId;
+                    }
+                }
+        }
+    }
+
+    // Fixed Keyframes. Keyframes that see Local MapPoints but that are not Local Keyframes
+    // 步骤4：得到能被局部MapPoints观测到，但不属于局部关键帧的关键帧，这些关键帧在局部BA优化时不优化
+    list<KeyFrame *> lFixedCameras;
+    //!遍历局部地图点
+    for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
+    {
+        //!得到每个局部地图点对应的关键帧
+        map<KeyFrame *, tuple<int, int>> observations = (*lit)->GetObservations();
+        //!对于每个局部地图点对应的关键帧做判断
+        for (map<KeyFrame *, tuple<int, int>>::iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
+        {
+            KeyFrame *pKFi = mit->first;
+            // pKFi->mnBALocalForKF!=pKF->mnId 表示不属于局部关键帧，
+            // pKFi->mnBAFixedForKF!=pKF->mnId 表示还未标记为fixed（固定的）关键帧
+            if (pKFi->mnBALocalForKF != pKF->mnId && pKFi->mnBAFixedForKF != pKF->mnId)
+            {
+                pKFi->mnBAFixedForKF = pKF->mnId;
+                if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
+                    lFixedCameras.push_back(pKFi);
+            }
+        }
+    }
+    // 步骤4.1：相比ORBSLAM2多出了判断固定关键帧的个数，最起码要两个固定的,如果实在没有就把lLocalKeyFrames中最早的KF固定，还是不够再加上第二早的KF固定
+    num_fixedKF = lFixedCameras.size() + num_fixedKF;
+
+    if (num_fixedKF == 0)
+    {
+        Verbose::PrintMess("LM-LBA: There are 0 fixed KF in the optimizations, LBA aborted", Verbose::VERBOSITY_NORMAL);
+        return;
+    }
+
+    // Setup optimizer
+    // 步骤5：构造g2o优化器
+    g2o::SparseOptimizer optimizer;
+    g2o::BlockSolver_6_3::LinearSolverType *linearSolver;
+
+    linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
+
+    g2o::BlockSolver_6_3 *solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
+
+    g2o::OptimizationAlgorithmLevenberg *solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+    if (pMap->IsInertial())
+        solver->setUserLambdaInit(100.0);
+
+    optimizer.setAlgorithm(solver);
+    optimizer.setVerbose(false);
+
+    if (pbStopFlag)
+        optimizer.setForceStopFlag(pbStopFlag);
+    
+    //!开始之前先记录一下参与BA的最大关键帧ID
+    unsigned long maxKFid = 0;
+
+    // // DEBUG LBA
+    // pCurrentMap->msOptKFs.clear();
+    // pCurrentMap->msFixedKFs.clear();
+
+    // Set Local KeyFrame vertices
+    // 步骤6：添加顶点：Pose of Local KeyFrame 
+    //!添加的是待优化的位姿的顶点
+    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+    {
+        KeyFrame *pKFi = *lit;
+        g2o::VertexSE3Expmap *vSE3 = new g2o::VertexSE3Expmap();
+        //!关键帧携带的初始位姿作为优化的初值
+        Sophus::SE3<float> Tcw = pKFi->GetPose();
+        vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
+
+        vSE3->setId(pKFi->mnId);
+        //!如果是初始关键帧，锁住位姿不优化
+        vSE3->setFixed(pKFi->mnId == pMap->GetInitKFid());
+        //!关键帧位姿加入顶点
+        optimizer.addVertex(vSE3);
+
+        if (pKFi->mnId > maxKFid)
+            maxKFid = pKFi->mnId;
+        // // DEBUG LBA
+        // pCurrentMap->msOptKFs.insert(pKFi->mnId);
+    }
+    num_OptKF = lLocalKeyFrames.size();
+
+    // Set Fixed KeyFrame vertices
+    // 步骤7：添加顶点：Pose of Fixed KeyFrame，注意这里调用了vSE3->setFixed(true)。
+    //!添加不优化的位姿顶点，为什么不优化也要添加呢，为了增加约束信息
+    for (list<KeyFrame *>::iterator lit = lFixedCameras.begin(), lend = lFixedCameras.end(); lit != lend; lit++)
+    {
+        KeyFrame *pKFi = *lit;
+        g2o::VertexSE3Expmap *vSE3 = new g2o::VertexSE3Expmap();
+        Sophus::SE3<float> Tcw = pKFi->GetPose();
+        vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(), Tcw.translation().cast<double>()));
+        vSE3->setId(pKFi->mnId);
+        vSE3->setFixed(true);
+        //!这些顶点的位姿都不优化，只是为了增加约束项
+        optimizer.addVertex(vSE3);
+        if (pKFi->mnId > maxKFid)
+            maxKFid = pKFi->mnId;
+        // // DEBUG LBA
+        // pCurrentMap->msFixedKFs.insert(pKFi->mnId);
+    }
+
+    // Set MapPoint vertices
+    // 步骤7：添加3D顶点
+    //!添加优化的地图点
+    // 存放的方式(举例)
+    // 边id: 1 2 3 4 5 6 7 8 9
+    // KFid: 1 2 3 4 1 2 3 2 3
+    // MPid: 1 1 1 1 2 2 2 3 3
+    // 所以这个个数大约是点数×帧数，实际肯定比这个要少
+    //!初始化边的数目 = 帧数目 * 地图点的数目
+    const int nExpectedSize = (lLocalKeyFrames.size() + lFixedCameras.size()) * lLocalMapPoints.size();
+
+    //! 存放单目时的边
+    vector<ORB_SLAM3::EdgeSE3ProjectXYZ *> vpEdgesMono;
+    vpEdgesMono.reserve(nExpectedSize);
+
+    //! 存放单目时的KF
+    vector<KeyFrame *> vpEdgeKFMono;
+    vpEdgeKFMono.reserve(nExpectedSize);
+
+
+    //! 存放单目时的MP
+    vector<MapPoint *> vpMapPointEdgeMono;
+    vpMapPointEdgeMono.reserve(nExpectedSize);
+
+    // 存放双目时的边
+    vector<g2o::EdgeStereoSE3ProjectXYZ *> vpEdgesStereo;
+    vpEdgesStereo.reserve(nExpectedSize);
+    // 存放双目时的KF
+    vector<KeyFrame *> vpEdgeKFStereo;
+    vpEdgeKFStereo.reserve(nExpectedSize);
+    // 存放双目时的MP
+    vector<MapPoint *> vpMapPointEdgeStereo;
+    vpMapPointEdgeStereo.reserve(nExpectedSize);
+
+    //!鲁棒核函数防止误差过大
+    const float thHuberMono = sqrt(5.991);
+    const float thHuberStereo = sqrt(7.815);
+
+    int nPoints = 0;
+
+    int nEdges = 0;
+
+    //! 添加顶点：MapPoint
+    for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
+    {
+        MapPoint *pMP = *lit;
+        g2o::VertexSBAPointXYZ *vPoint = new g2o::VertexSBAPointXYZ();
+        vPoint->setEstimate(pMP->GetWorldPos().cast<double>());//!地图点的世界坐标系坐标设为初值
+        int id = pMP->mnId + maxKFid + 1; //!在maxKFid 之后再设置地图点的ID
+        vPoint->setId(id);
+        //!由于使用了LinearSolverType， 所以需要将所有的三维点边缘化掉
+        // 这里的边缘化与滑动窗口不同，而是为了加速稀疏矩阵的计算BlockSolver_6_3默认了6维度的不边缘化，3自由度的三维点被边缘化，所以所有三维点都设置边缘化
+        vPoint->setMarginalized(true);
+        optimizer.addVertex(vPoint);
+        nPoints++;
+        //观测到该地图点的关键帧，和该地图点在关键帧中的索引
+        const map<KeyFrame *, tuple<int, int>> observations = pMP->GetObservations();
+
+        // Set edges
+        //!  步骤8：对每一对关联的MapPoint和KeyFrame构建边
+        for (map<KeyFrame *, tuple<int, int>>::const_iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
+        {
+            KeyFrame *pKFi = mit->first;
+
+            if (!pKFi->isBad() && pKFi->GetMap() == pCurrentMap)
+            {
+                const int leftIndex = get<0>(mit->second);
+
+                // Monocular observation
+                // 单目
+                if (leftIndex != -1 && pKFi->mvuRight[get<0>(mit->second)] < 0)
+                {
+                    const cv::KeyPoint &kpUn = pKFi->mvKeysUn[leftIndex]; //! 当前地图点对应的二维的特征点
+                    Eigen::Matrix<double, 2, 1> obs;
+                    obs << kpUn.pt.x, kpUn.pt.y; //!观测值
+                    //!这里设置了边的形式
+                    ORB_SLAM3::EdgeSE3ProjectXYZ *e = new ORB_SLAM3::EdgeSE3ProjectXYZ();
+                    //!三维点
+                    e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
+                    //!初始估计位姿
+                    e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
+                    e->setMeasurement(obs);
+                    //!边的权重的设置方式（信息矩阵）
+                    //!权重为特征点所在的图像金字塔的层数的倒数，层数越高，该特征点的误差置信度越低
+                    const float &invSigma2 = pKFi->mvInvLevelSigma2[kpUn.octave];
+                    e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
+                    //!用鲁棒核函数抑制外点
+                    g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+                    e->setRobustKernel(rk);
+                    rk->setDelta(thHuberMono);
+
+                    e->pCamera = pKFi->mpCamera;
+
+                    optimizer.addEdge(e);
+                    vpEdgesMono.push_back(e);
+                    vpEdgeKFMono.push_back(pKFi);
+                    vpMapPointEdgeMono.push_back(pMP);
+
+                    nEdges++;
+                }
+                //双目的情况
+                else if (leftIndex != -1 && pKFi->mvuRight[get<0>(mit->second)] >= 0) // Stereo observation
+                {
+                    const cv::KeyPoint &kpUn = pKFi->mvKeysUn[leftIndex];
+                    Eigen::Matrix<double, 3, 1> obs;
+                    const float kp_ur = pKFi->mvuRight[get<0>(mit->second)];
+                    obs << kpUn.pt.x, kpUn.pt.y, kp_ur;
+
+                    g2o::EdgeStereoSE3ProjectXYZ *e = new g2o::EdgeStereoSE3ProjectXYZ();
+
+                    e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
+                    e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKFi->mnId)));
+                    e->setMeasurement(obs);
+                    const float &invSigma2 = pKFi->mvInvLevelSigma2[kpUn.octave];
+                    Eigen::Matrix3d Info = Eigen::Matrix3d::Identity() * invSigma2;
+                    e->setInformation(Info);
+
+                    g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+                    e->setRobustKernel(rk);
+                    rk->setDelta(thHuberStereo);
+
+                    e->fx = pKFi->fx;
+                    e->fy = pKFi->fy;
+                    e->cx = pKFi->cx;
+                    e->cy = pKFi->cy;
+                    e->bf = pKFi->mbf;
+
+                    optimizer.addEdge(e);
+                    vpEdgesStereo.push_back(e);
+                    vpEdgeKFStereo.push_back(pKFi);
+                    vpMapPointEdgeStereo.push_back(pMP);
+
+                    nEdges++;
+                }
+            }
+        }
+    }
+    num_edges = nEdges;
+
+    if (pbStopFlag)
+        if (*pbStopFlag)
+            return;
+
+    //!步骤9：开始优化
+    optimizer.initializeOptimization();
+    optimizer.optimize(10);
+
+    vector<pair<KeyFrame *, MapPoint *>> vToErase;
+    vToErase.reserve(vpEdgesMono.size() + vpEdgesStereo.size());
+
+    // Check inlier observations
+    //! 步骤10：在优化后重新计算误差，剔除连接误差比较大的关键帧和MapPoint
+    for (size_t i = 0, iend = vpEdgesMono.size(); i < iend; i++)
+    {
+        ORB_SLAM3::EdgeSE3ProjectXYZ *e = vpEdgesMono[i];
+        MapPoint *pMP = vpMapPointEdgeMono[i];
+
+        if (pMP->isBad())
+            continue;
+
+        if (e->chi2() > 5.991 || !e->isDepthPositive())
+        {
+            KeyFrame *pKFi = vpEdgeKFMono[i];
+            vToErase.push_back(make_pair(pKFi, pMP));
+        }
+    }
+
+    for (size_t i = 0, iend = vpEdgesStereo.size(); i < iend; i++)
+    {
+        //std::cout << "error 2" << std::endl;
+        g2o::EdgeStereoSE3ProjectXYZ *e = vpEdgesStereo[i];
+        MapPoint *pMP = vpMapPointEdgeStereo[i];
+
+        if (pMP->isBad())
+            continue;
+
+        if (e->chi2() > 7.815 || !e->isDepthPositive())
+        {
+            KeyFrame *pKFi = vpEdgeKFStereo[i];
+            vToErase.push_back(make_pair(pKFi, pMP));
+        }
+    }
+
+    // Get Map Mutex
+    unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+    //!删除点，在关键帧中剔除对该地图点的观测，在地图点中剔除对该关键帧的观测
+    if (!vToErase.empty())
+    {
+        for (size_t i = 0; i < vToErase.size(); i++)
+        {
+            KeyFrame *pKFi = vToErase[i].first;
+            MapPoint *pMPi = vToErase[i].second;
+            pKFi->EraseMapPointMatch(pMPi);
+            pMPi->EraseObservation(pKFi);
+        }
+    }
+
+    // Recover optimized data
+    // Keyframes
+    //!优化后更新关键帧的位姿以及地图点的位置，平均观测方向
+    bool bShowStats = false;
+    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+    {
+        KeyFrame *pKFi = *lit;
+        g2o::VertexSE3Expmap *vSE3 = static_cast<g2o::VertexSE3Expmap *>(optimizer.vertex(pKFi->mnId));
+        g2o::SE3Quat SE3quat = vSE3->estimate();
+        Sophus::SE3f Tiw(SE3quat.rotation().cast<float>(), SE3quat.translation().cast<float>());
+        pKFi->SetPose(Tiw);
+    }
+
+    // Points
+    for (list<MapPoint *>::iterator lit = lLocalMapPoints.begin(), lend = lLocalMapPoints.end(); lit != lend; lit++)
+    {
+        MapPoint *pMP = *lit;
+        g2o::VertexSBAPointXYZ *vPoint = static_cast<g2o::VertexSBAPointXYZ *>(optimizer.vertex(pMP->mnId + maxKFid + 1));
+        pMP->SetWorldPos(vPoint->estimate().cast<float>());
+        pMP->UpdateNormalAndDepth();
+    }
+
+    pMap->IncreaseChangeIndex();
+}
 
 
 } // namespace ORB_SLAM

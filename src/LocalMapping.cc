@@ -91,6 +91,8 @@ void LocalMapping::SetTracker(Tracking *pTracker)
 /**
  * @brief 局部地图线程主函数
  */
+
+//!
 void LocalMapping::Run()
 {
     // 标记状态，表示当前run函数正在运行，尚未结束
